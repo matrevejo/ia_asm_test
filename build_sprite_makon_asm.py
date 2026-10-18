@@ -397,7 +397,7 @@ Makon_Spr1:
 		END
 """
 
-with open('hd/code/sprite_makon.s', 'w', encoding='latin1') as f:
+with open('hd/code/sprite_makon.s', 'w', encoding='utf-8') as f:
     f.write(asm_content)
 
 print('Updated hd/code/sprite_makon.s with bulletproof hardware code!')
