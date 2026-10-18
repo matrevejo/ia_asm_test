@@ -1,5 +1,3 @@
-import os
-
 with open('hd/code/makon_data.i', 'r', encoding='utf-8') as f:
     sprite_data = f.read()
 
@@ -7,19 +5,20 @@ parts = sprite_data.split('; Makon Sprite 1 (Right 16x32)')
 spr0_data = parts[0].replace('; Makon Sprite 0 (Left 16x32)', '').strip()
 spr1_data = parts[1].strip()
 
-asm_template = """* ==========================================================
-* Proyecto : Amiga 500 ASM - Sprite 32x32 Rebotando
+asm_content = """* ==========================================================
+* Proyecto : Amiga 500 ASM - Makon 32x32 Rebotando
 * Fichero  : sprite_makon.s
 *
 * Caracteristicas:
-*   - Sprite 32x32 pixeles (combinando Sprite 0 y Sprite 1)
-*   - Paleta de 4 colores (Transparente + 3 colores)
-*   - Movimiento suave a 50 FPS sincronizado con VBlank
-*   - Rebote contra los 4 bordes de la pantalla
-*   - Salida limpia al pulsar Boton Izquierdo del Raton (LMB)
+*   - Sprite de 32x32 pixeles (combinando Sprite 0 y Sprite 1)
+*   - Ventana de visualizacion PAL completa (DIWSTRT / DIWSTOP)
+*   - Acceso a registros Custom mediante base a5 ($dff000)
+*   - Sincronizacion a 50 FPS con VBlank
+*   - Rebote continuo contra los 4 bordes de la pantalla
+*   - Salida limpia a ASM-One con el Boton Izquierdo (LMB)
 * ==========================================================
 
-; Constantes de limites de pantalla (hardware PAL/OCS)
+; Constantes de limites de pantalla visible (hardware PAL)
 MIN_X		EQU	130		; Borde izquierdo visible
 MAX_X		EQU	416		; Borde derecho visible (448 - 32)
 MIN_Y		EQU	44		; Borde superior visible
@@ -34,28 +33,23 @@ _LVOLoadView	EQU	-222
 _LVOWaitTOF	EQU	-270
 _LVOWaitBlit	EQU	-228
 
-; Registros Custom del Chipset Amiga
-DMACONR		EQU	$dff002
-VPOSR		EQU	$dff004
-COP1LCH		EQU	$dff080
-COPJMP1		EQU	$dff088
-DMACON		EQU	$dff096
-CIAA_PRA	EQU	$bfe001
-
 		SECTION	MakonChip,CODE_C
 
 Start:
-		; Guardar todos los registros
+		; Guardar todos los registros de la CPU
 		movem.l	d0-d7/a0-a6,-(sp)
 
-		; Reinicializar variables por si se ejecuta varias veces (con comando 'j')
+		; a5 = Puntero base permanente a los registros del Chipset ($dff000)
+		lea	$dff000,a5
+
+		; Reinicializar variables de estado
 		move.w	#200,PosX
 		move.w	#100,PosY
 		move.w	#2,VelX
 		move.w	#2,VelY
 
 		; --------------------------------------------------
-		; 1. Tomar control del sistema limpiamente
+		; 1. Abrir Graphics Library y guardar estado del OS
 		; --------------------------------------------------
 		move.l	ExecBase.w,a6
 		lea	GfxName(pc),a1
@@ -70,7 +64,7 @@ Start:
 		move.l	$22(a6),OldView		; gb_ActiView (offset 34)
 		move.l	$26(a6),OldCop		; gb_copinit (offset 38)
 
-		; Esperar a que el sistema termine de dibujar
+		; Esperar fin de cuadro y desconectar View del OS
 		jsr	_LVOWaitTOF(a6)
 		suba.l	a1,a1
 		jsr	_LVOLoadView(a6)	; Limpiar View
@@ -78,59 +72,58 @@ Start:
 		jsr	_LVOWaitBlit(a6)	; Esperar Blitter
 
 		; Guardar estado previo de DMA
-		move.w	DMACONR,OldDma
+		move.w	$002(a5),OldDma		; DMACONR
 
 		; --------------------------------------------------
-		; 2. Configurar la Copper list y activar Sprites
+		; 2. Preparar Copper List y Activar Hardware
 		; --------------------------------------------------
+		; Escribir punteros de Sprite 0 y Sprite 1 en la Copper list
 		bsr	InitCopperPointers
 
-		; Actualizar posicion inicial de ambos sprites
+		; Calcular posicion inicial en palabras de control de los sprites
 		bsr	UpdateSprites
 
-		; Activar nuestra Copper list
-		move.l	#CopperList,COP1LCH
-		clr.w	COPJMP1
+		; Cargar nuestra Copper List en el hardware
+		move.l	#CopperList,$080(a5)	; COP1LCH
+		move.w	#0,$088(a5)		; COPJMP1 (estroboscopico para iniciar Copper)
 
-		; Desactivar bitplanes y activar DMA de Copper + Sprites
-		; $82a0 = DMAF_SETCLR | DMAF_DMAEN | DMAF_COPPER | DMAF_SPREN
-		move.w	#$0100,DMACON		; Desactivar bitplanes
-		move.w	#$82a0,DMACON		; Activar Copper y Sprites
+		; Desactivar bitplanes y activar Copper + Sprites
+		move.w	#$0100,$096(a5)		; Desactivar Bitplane DMA
+		move.w	#$82a0,$096(a5)		; Activar DMAEN | COPEN | SPREN
 
 ; ==========================================================
 ; Bucle Principal
 ; ==========================================================
 MainLoop:
-		; Sincronizar a 50 cuadros por segundo (VBlank)
+		; Esperar al refresco vertical (50 FPS)
 		bsr	WaitVBL
 
-		; Mover el Makon y rebotar si toca las paredes
+		; Actualizar posicion y rebotar si toca los bordes
 		bsr	MoveSprite
 
-		; Actualizar las palabras de control de Sprite 0 y Sprite 1
+		; Actualizar coordenadas de los sprites para el siguiente cuadro
 		bsr	UpdateSprites
 
-		; Comprobar si se ha pulsado el boton izquierdo del raton (LMB)
-		; CIA-A bit 6 = 0 cuando se pulsa
-		btst	#6,CIAA_PRA
+		; Comprobar el boton izquierdo del raton (LMB)
+		; CIA-A ($bfe001) bit 6 = 0 cuando se presiona
+		btst	#6,$bfe001
 		bne.s	MainLoop
 
 ; ==========================================================
 ; Salida y Restauracion Limpia del Sistema
 ; ==========================================================
 ExitProgram:
-		; Esperar VBlank para no cortar el escaneo bruscamente
 		bsr	WaitVBL
 
-		; Apagar DMAs y restaurar estado anterior
-		move.w	#$7fff,DMACON		; Desactivar todos los DMAs
+		; Apagar DMAs y restaurar el estado original del sistema
+		move.w	#$7fff,$096(a5)		; Desactivar todos los DMAs
 		move.w	OldDma(pc),d0
 		ori.w	#$8000,d0		; Activar bit SET/CLR
-		move.w	d0,DMACON		; Restaurar DMAs originales
+		move.w	d0,$096(a5)		; Restaurar DMAs
 
-		; Restaurar Copper list original del sistema
-		move.l	OldCop(pc),COP1LCH
-		clr.w	COPJMP1
+		; Restaurar Copper original del sistema
+		move.l	OldCop(pc),$080(a5)	; COP1LCH
+		move.w	#0,$088(a5)		; COPJMP1
 
 		; Restaurar View original de Workbench / ASM-One
 		move.l	GfxBase(pc),a6
@@ -144,7 +137,6 @@ ExitProgram:
 		jsr	_LVOCloseLibrary(a6)
 
 ExitDirect:
-		; Restaurar registros y regresar a ASM-One
 		movem.l	(sp)+,d0-d7/a0-a6
 		rts
 
@@ -153,62 +145,71 @@ ExitDirect:
 ; ==========================================================
 
 ; ----------------------------------------------------------
-; Espera al refresco vertical (Linea 250)
+; Espera al inicio del borrado vertical (VBlank - linea 250)
+; Usa a5 ($dff000) para garantizar acceso exacto sin bugs de bus
 ; ----------------------------------------------------------
 WaitVBL:
-.vbl1:
-		move.l	VPOSR,d0
+.wait1:
+		move.l	$004(a5),d0		; Leer VPOSR / VHPOSR ($dff004)
+		andi.l	#$1ff00,d0
+		cmpi.l	#$0fa00,d0		; Linea 250 ($FA)
+		bne.s	.wait1
+.wait2:
+		move.l	$004(a5),d0
 		andi.l	#$1ff00,d0
 		cmpi.l	#$0fa00,d0
-		bne.s	.vbl1
-.vbl2:
-		move.l	VPOSR,d0
-		andi.l	#$1ff00,d0
-		cmpi.l	#$0fa00,d0
-		beq.s	.vbl2
+		beq.s	.wait2
 		rts
 
 ; ----------------------------------------------------------
-; Movimiento y Deteccion de Rebote
+; Movimiento con Rebote en los 4 bordes
 ; ----------------------------------------------------------
 MoveSprite:
-		; --- Eje X ---
+		; --- Eje Horizontal (X) ---
 		move.w	PosX(pc),d0
 		add.w	VelX(pc),d0
 
 		cmpi.w	#MIN_X,d0
 		bgt.s	.chkMaxX
 		move.w	#MIN_X,d0
-		neg.w	VelX			; Invertir direccion horizontal
+		move.w	VelX(pc),d2
+		neg.w	d2
+		move.w	d2,VelX
 		bra.s	.doneX
 .chkMaxX:
 		cmpi.w	#MAX_X,d0
 		blt.s	.doneX
 		move.w	#MAX_X,d0
-		neg.w	VelX			; Invertir direccion horizontal
+		move.w	VelX(pc),d2
+		neg.w	d2
+		move.w	d2,VelX
 .doneX:
 		move.w	d0,PosX
 
-		; --- Eje Y ---
+		; --- Eje Vertical (Y) ---
 		move.w	PosY(pc),d1
 		add.w	VelY(pc),d1
 
 		cmpi.w	#MIN_Y,d1
 		bgt.s	.chkMaxY
 		move.w	#MIN_Y,d1
-		neg.w	VelY			; Invertir direccion vertical
+		move.w	VelY(pc),d2
+		neg.w	d2
+		move.w	d2,VelY
 		bra.s	.doneY
 .chkMaxY:
 		cmpi.w	#MAX_Y,d1
 		blt.s	.doneY
 		move.w	#MAX_Y,d1
-		neg.w	VelY			; Invertir direccion vertical
+		move.w	VelY(pc),d2
+		neg.w	d2
+		move.w	d2,VelY
 .doneY:
 		move.w	d1,PosY
 		rts
 
 ; ----------------------------------------------------------
-; Actualiza Sprite 0 y Sprite 1 para formar el Makon de 32x32
+; Actualiza Sprite 0 y Sprite 1
 ; ----------------------------------------------------------
 UpdateSprites:
 		; Sprite 0: Mitad izquierda (16x32) en (PosX, PosY)
@@ -221,19 +222,19 @@ UpdateSprites:
 		; Sprite 1: Mitad derecha (16x32) en (PosX + 16, PosY)
 		lea	Makon_Spr1,a0
 		move.w	PosX(pc),d0
-		add.w	#16,d0			; Desplazado 16 pixeles
+		add.w	#16,d0			; 16 pixeles a la derecha
 		move.w	PosY(pc),d1
 		moveq	#SPRITE_H,d2
 		bsr	SetSpritePos
 		rts
 
 ; ----------------------------------------------------------
-; SetSpritePos
-; Parametros:
-;   d0.w = X (coordenada hardware)
-;   d1.w = Y (coordenada hardware)
-;   d2.w = Altura del sprite (32)
-;   a0   = Puntero a la estructura del sprite
+; SetSpritePos: Empaqueta coordenadas en las cabeceras POS y CTL
+; Entrada:
+;   d0.w = X
+;   d1.w = Y
+;   d2.w = Altura (32)
+;   a0   = Puntero al Sprite en Chip RAM
 ; ----------------------------------------------------------
 SetSpritePos:
 		movem.l	d0-d4,-(sp)
@@ -254,7 +255,7 @@ SetSpritePos:
 		andi.w	#$00ff,d0
 		or.w	d0,d4
 		move.w	(sp)+,d0
-		move.w	d4,(a0)			; Escribir Word 0 (POS)
+		move.w	d4,(a0)			; Escribir POS
 
 		; Word 1 (CTL):
 		; Byte alto = VSTOP & $ff
@@ -262,7 +263,6 @@ SetSpritePos:
 		;   Bit 2 = bit 8 de Y
 		;   Bit 1 = bit 8 de VSTOP
 		;   Bit 0 = bit 0 de X
-		;   Bit 7 = ATTACH (0)
 		move.w	d3,d4
 		andi.w	#$00ff,d4
 		lsl.w	#8,d4
@@ -279,37 +279,39 @@ SetSpritePos:
 		beq.s	.noX0
 		bset	#0,d4
 .noX0:
-		move.w	d4,2(a0)		; Escribir Word 1 (CTL)
+		move.w	d4,2(a0)		; Escribir CTL
 
 		movem.l	(sp)+,d0-d4
 		rts
 
 ; ----------------------------------------------------------
-; Inicializa los punteros de sprite en la Copper list
+; Escribe los punteros de Chip RAM dentro de la Copper List
 ; ----------------------------------------------------------
 InitCopperPointers:
-		; Sprite 0
+		lea	CopperList,a0
+
+		; Sprite 0 (Mitad Izquierda) -> Offsets 22 (High) y 26 (Low)
 		move.l	#Makon_Spr0,d0
-		move.w	d0,CopSpr0L
+		move.w	d0,26(a0)		; SPR0PTL
 		swap	d0
-		move.w	d0,CopSpr0H
+		move.w	d0,22(a0)		; SPR0PTH
 
-		; Sprite 1
+		; Sprite 1 (Mitad Derecha) -> Offsets 30 (High) y 34 (Low)
 		move.l	#Makon_Spr1,d0
-		move.w	d0,CopSpr1L
+		move.w	d0,34(a0)		; SPR1PTL
 		swap	d0
-		move.w	d0,CopSpr1H
+		move.w	d0,30(a0)		; SPR1PTH
 
-		; Sprites 2 a 7 (apuntan a NullSprite)
+		; Sprites 2 a 7 -> apuntar a NullSprite (desde offset 36)
 		move.l	#NullSprite,d0
-		lea	CopSpr2H,a0
-		moveq	#5,d1
+		lea	36(a0),a1
+		moveq	#5,d1			; 6 sprites (2 a 7)
 .loopNull:
 		swap	d0
-		move.w	d0,(a0)			; CopSprXH
+		move.w	d0,2(a1)		; SPRxPTH
 		swap	d0
-		move.w	d0,4(a0)		; CopSprXL
-		addq.w	#8,a0
+		move.w	d0,6(a1)		; SPRxPTL
+		addq.w	#8,a1
 		dbf	d1,.loopNull
 		rts
 
@@ -330,62 +332,46 @@ GfxBase:	dc.l	0
 GfxName:	dc.b	"graphics.library",0
 		EVEN
 
-; Copper List
+; ----------------------------------------------------------
+; Copper List (Cada instruccion ocupa exactamente 4 bytes)
+; ----------------------------------------------------------
 CopperList:
-		dc.w	$0100,$0200		; BPLCON0 = 0 bitplanes (pantalla limpia)
+		; 1. Definicion de la ventana visible de visualizacion (DIW)
+		dc.w	$008e,$2c81		; Offset  0: DIWSTRT (Linea $2c, Horiz $81)
+		dc.w	$0090,$2cc1		; Offset  4: DIWSTOP (Linea $2c, Horiz $c1)
+		dc.w	$0100,$0200		; Offset  8: BPLCON0 (0 bitplanes, COLOR burst activo)
+		dc.w	$0102,$0000		; Offset 12: BPLCON1 (Scroll = 0)
+		dc.w	$0104,$0024		; Offset 16: BPLCON2 (Sprites con maxima prioridad)
 
-		; Punteros Sprite 0
-		dc.w	$0120
-CopSpr0H:	dc.w	0
-		dc.w	$0122
-CopSpr0L:	dc.w	0
+		; 2. Punteros de Sprites (Rellenados en ejecucion por InitCopperPointers)
+		dc.w	$0120,0			; Offset 20: SPR0PTH (Sprite 0 High)
+		dc.w	$0122,0			; Offset 24: SPR0PTL (Sprite 0 Low)
+		dc.w	$0124,0			; Offset 28: SPR1PTH (Sprite 1 High)
+		dc.w	$0126,0			; Offset 32: SPR1PTL (Sprite 1 Low)
 
-		; Punteros Sprite 1
-		dc.w	$0124
-CopSpr1H:	dc.w	0
-		dc.w	$0126
-CopSpr1L:	dc.w	0
+		dc.w	$0128,0			; Offset 36: SPR2PTH
+		dc.w	$012a,0			; Offset 40: SPR2PTL
+		dc.w	$012c,0			; Offset 44: SPR3PTH
+		dc.w	$012e,0			; Offset 48: SPR3PTL
+		dc.w	$0130,0			; Offset 52: SPR4PTH
+		dc.w	$0132,0			; Offset 56: SPR4PTL
+		dc.w	$0134,0			; Offset 60: SPR5PTH
+		dc.w	$0136,0			; Offset 64: SPR5PTL
+		dc.w	$0138,0			; Offset 68: SPR6PTH
+		dc.w	$013a,0			; Offset 72: SPR6PTL
+		dc.w	$013c,0			; Offset 76: SPR7PTH
+		dc.w	$013e,0			; Offset 80: SPR7PTL
 
-		; Punteros Sprites 2 a 7
-		dc.w	$0128
-CopSpr2H:	dc.w	0
-		dc.w	$012a
-CopSpr2L:	dc.w	0
+		; 3. Paleta de Colores
+		dc.w	$0180,$0124		; Offset 84: COLOR00: Fondo Azul Pizarra Oscuro
+		dc.w	$01a2,$0000		; Offset 88: COLOR17: Negro (Contornos Makon)
+		dc.w	$01a4,$0889		; Offset 92: COLOR18: Gris (Pelaje Makon)
+		dc.w	$01a6,$0fff		; Offset 96: COLOR19: Blanco brillante (Ojos Makon)
 
-		dc.w	$012c
-CopSpr3H:	dc.w	0
-		dc.w	$012e
-CopSpr3L:	dc.w	0
+		; Fin de la Copper List
+		dc.w	$ffff,$fffe
 
-		dc.w	$0130
-CopSpr4H:	dc.w	0
-		dc.w	$0132
-CopSpr4L:	dc.w	0
-
-		dc.w	$0134
-CopSpr5H:	dc.w	0
-		dc.w	$0136
-CopSpr5L:	dc.w	0
-
-		dc.w	$0138
-CopSpr6H:	dc.w	0
-		dc.w	$013a
-CopSpr6L:	dc.w	0
-
-		dc.w	$013c
-CopSpr7H:	dc.w	0
-		dc.w	$013e
-CopSpr7L:	dc.w	0
-
-		; Paleta de Colores
-		dc.w	$0180,$0124		; COLOR00: Azul pizarra oscuro de fondo
-		dc.w	$01a2,$0000		; COLOR17: Negro (contorno, ojos, pies)
-		dc.w	$01a4,$0889		; COLOR18: Gris medio (cuerpo peludo Makon)
-		dc.w	$01a6,$0fff		; COLOR19: Blanco brillante (brillos, ojos)
-
-		dc.w	$ffff,$fffe		; Fin de la Copper List
-
-; Sprite vacio para desactivar sprites 2 a 7
+; Sprite nulo (terminador inmediato) para apagar los canales 2 a 7
 NullSprite:
 		dc.w	0,0,0,0
 
@@ -393,7 +379,7 @@ NullSprite:
 ; Estructura Sprite 0 (Mitad Izquierda: 16x32)
 ; ----------------------------------------------------------
 Makon_Spr0:
-		dc.w	0,0			; POS y CTL (calculadas en ejecucion)
+		dc.w	0,0			; POS y CTL (actualizados cada cuadro)
 """ + spr0_data + """
 		dc.w	0,0			; Terminador de sprite
 
@@ -401,7 +387,7 @@ Makon_Spr0:
 ; Estructura Sprite 1 (Mitad Derecha: 16x32)
 ; ----------------------------------------------------------
 Makon_Spr1:
-		dc.w	0,0			; POS y CTL (calculadas en ejecucion)
+		dc.w	0,0			; POS y CTL (actualizados cada cuadro)
 """ + spr1_data + """
 		dc.w	0,0			; Terminador de sprite
 
@@ -409,6 +395,6 @@ Makon_Spr1:
 """
 
 with open('hd/code/sprite_makon.s', 'w', encoding='latin1') as f:
-    f.write(asm_template)
+    f.write(asm_content)
 
-print('Generated hd/code/sprite_makon.s successfully! Size:', len(asm_template), 'bytes')
+print('Updated hd/code/sprite_makon.s with bulletproof hardware code!')
