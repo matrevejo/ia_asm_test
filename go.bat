@@ -1,0 +1,1 @@
+D:\git\amiga\ia_asm_test\winuae.exe -f D:\git\amiga\ia_asm_test\config\config.uae
