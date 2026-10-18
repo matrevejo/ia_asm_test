@@ -2,8 +2,11 @@ with open('hd/code/makon_data.i', 'r', encoding='utf-8') as f:
     sprite_data = f.read()
 
 parts = sprite_data.split('; Makon Sprite 1 (Right 16x32)')
-spr0_data = parts[0].replace('; Makon Sprite 0 (Left 16x32)', '').strip()
-spr1_data = parts[1].strip()
+spr0_raw = parts[0].replace('; Makon Sprite 0 (Left 16x32)', '').strip()
+spr1_raw = parts[1].strip()
+
+spr0_data = '\n'.join('\t\t' + line.strip() for line in spr0_raw.splitlines() if line.strip())
+spr1_data = '\n'.join('\t\t' + line.strip() for line in spr1_raw.splitlines() if line.strip())
 
 asm_content = """* ==========================================================
 * Proyecto : Amiga 500 ASM - Makon 32x32 Rebotando
